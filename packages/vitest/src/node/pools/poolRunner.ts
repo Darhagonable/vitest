@@ -53,7 +53,9 @@ export class PoolRunner {
   public readonly project: TestProject
   public environment: ContextTestEnvironment
 
-  private _lastTestFiles: string[]
+  /** Files this runner last ran. Used to route isolated tasks back to their warm worker. */
+  public lastTestFiles: string[] = []
+
   private _state: RunnerState = RunnerState.IDLE
   private _operationLock: DeferPromise<void> | null = null
   private _terminatePromise: DeferPromise<void> = createDefer()
@@ -90,7 +92,6 @@ export class PoolRunner {
     this.environment = options.environment
 
     const vitest = this.project.vitest
-    this._lastTestFiles = []
     this._traces = vitest._traces
     if (this._traces.isEnabled()) {
       const { span: workerSpan, context } = this._traces.startContextSpan('vitest.worker')
@@ -159,8 +160,8 @@ export class PoolRunner {
   }
 
   request(method: 'run' | 'collect', context: WorkerExecuteContext): void {
-    this._lastTestFiles = context.files.map((f) => f.filepath)
-    this._otel?.files.push(...this._lastTestFiles)
+    this.lastTestFiles = context.files.map((f) => f.filepath)
+    this._otel?.files.push(...this.lastTestFiles)
     return this.postMessage({
       __vitest_worker_request__: true,
       type: method,
@@ -338,7 +339,7 @@ export class PoolRunner {
       this._state = RunnerState.STOPPED
       throw error
     } finally {
-      this._lastTestFiles = []
+      this.lastTestFiles = []
       this._operationLock.resolve()
       this._operationLock = null
       this._otel?.span.end()
@@ -386,8 +387,8 @@ export class PoolRunner {
       hasCode || signal
         ? `with ${hasCode ? `exit code ${code} ` : ''}${signal ? `signal ${signal} ` : ''}`
         : ''
-    const testFileDetails = this._lastTestFiles.length
-      ? ` while running test file${this._lastTestFiles.length === 1 ? '' : 's'} ${this._lastTestFiles.join(', ')}`
+    const testFileDetails = this.lastTestFiles.length
+      ? ` while running test file${this.lastTestFiles.length === 1 ? '' : 's'} ${this.lastTestFiles.join(', ')}`
       : ''
     const error = new Error(
       `Worker exited unexpectedly ${errorDetails}during ${this._state} state${testFileDetails}`,

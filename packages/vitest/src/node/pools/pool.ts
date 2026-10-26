@@ -2,7 +2,7 @@ import type { Span } from '@opentelemetry/api'
 import type { ContextTestEnvironment } from '../../types/worker'
 import type { Logger } from '../logger'
 import type { StateManager } from '../state'
-import type { PoolOptions, PoolTask, WorkerResponse } from './types'
+import type { PoolOptions, PoolTask, PoolWorker, WorkerResponse } from './types'
 import { PoolRunner } from './poolRunner'
 import { ForksPoolWorker } from './workers/forksWorker'
 import { ThreadsPoolWorker } from './workers/threadsWorker'
@@ -15,6 +15,7 @@ const WORKER_START_TIMEOUT = 90_000
 interface Options {
   distPath: string
   teardownTimeout: number
+  watch: boolean
   state: StateManager
 }
 
@@ -162,13 +163,25 @@ export class Pool {
         this.activeTasks.splice(index, 1)
       }
 
+      // in watch mode, a runner of a reusable worker is kept after an isolated
+      // task, so a rerun of the same files reuses the warm worker; the file
+      // check in `isEqualRunner` keeps other files away from it
       if (
-        !task.isolate &&
         !runner.isTerminated &&
         !isMemoryLimitReached &&
-        this.queue[0]?.task.isolate === false &&
-        isEqualRunner(runner, this.queue[0].task)
+        ((this.options.watch &&
+          method === 'run' &&
+          task.isolate &&
+          !resolver.isRejected &&
+          runner.worker.canReuse?.(task)) ||
+          (!task.isolate &&
+            this.queue[0]?.task.isolate === false &&
+            isEqualRunner(runner, this.queue[0].task)))
       ) {
+        // a parked runner frees its concurrency slot and acquires a new one
+        // if a future task reuses it
+        runner.poolId = undefined
+        workerIds.set(poolId, true)
         this.sharedRunners.push(runner)
         return this.schedule()
       }
@@ -242,15 +255,35 @@ export class Pool {
     await this.cancel()
   }
 
-  private getPoolRunner(task: PoolTask, method: 'run' | 'collect'): PoolRunner {
-    if (task.isolate === false) {
-      const index = this.sharedRunners.findIndex((runner) => isEqualRunner(runner, task))
+  private createRunner(options: PoolOptions, worker: PoolWorker): PoolRunner {
+    const runner = new PoolRunner(options, worker)
+    // a parked runner can die on its own; retire it so the next rerun of its
+    // files spawns a fresh worker instead of reusing a dead one
+    runner.on('error', () => this.retireParkedRunner(runner))
+    return runner
+  }
 
-      if (index !== -1) {
-        const runner = this.sharedRunners.splice(index, 1)[0]
-        runner.reconfigure(task)
-        return runner
-      }
+  private retireParkedRunner(runner: PoolRunner): void {
+    const index = this.sharedRunners.indexOf(runner)
+    if (index !== -1) {
+      this.sharedRunners.splice(index, 1)
+      this.logger.error(
+        `[vitest-pool]: Worker ${runner.worker.name} terminated unexpectedly while idle.`,
+      )
+    }
+  }
+
+  private getPoolRunner(task: PoolTask, method: 'run' | 'collect'): PoolRunner {
+    // a warm worker was started for `run` and never serves `collect` tasks
+    const index =
+      task.isolate && method !== 'run'
+        ? -1
+        : this.sharedRunners.findIndex((runner) => isEqualRunner(runner, task))
+
+    if (index !== -1) {
+      const runner = this.sharedRunners.splice(index, 1)[0]
+      runner.reconfigure(task)
+      return runner
     }
 
     const options: PoolOptions = {
@@ -264,24 +297,24 @@ export class Pool {
 
     switch (task.worker) {
       case 'forks':
-        return new PoolRunner(options, new ForksPoolWorker(options))
+        return this.createRunner(options, new ForksPoolWorker(options))
 
       case 'vmForks':
-        return new PoolRunner(options, new VmForksPoolWorker(options))
+        return this.createRunner(options, new VmForksPoolWorker(options))
 
       case 'threads':
-        return new PoolRunner(options, new ThreadsPoolWorker(options))
+        return this.createRunner(options, new ThreadsPoolWorker(options))
 
       case 'vmThreads':
-        return new PoolRunner(options, new VmThreadsPoolWorker(options))
+        return this.createRunner(options, new VmThreadsPoolWorker(options))
 
       case 'typescript':
-        return new PoolRunner(options, new TypecheckPoolWorker(options))
+        return this.createRunner(options, new TypecheckPoolWorker(options))
     }
 
     const customPool = task.project.config.poolRunner
     if (customPool != null && customPool.name === task.worker) {
-      return new PoolRunner(options, customPool.createPoolWorker(options))
+      return this.createRunner(options, customPool.createPoolWorker(options))
     }
 
     throw new Error(`Runner ${task.worker} is not supported. Test files: ${formatFiles(task)}.`)
@@ -336,11 +369,17 @@ function formatFiles(task: PoolTask) {
 }
 
 function isEqualRunner(runner: PoolRunner, task: PoolTask) {
-  if (task.isolate) {
-    throw new Error('Isolated tasks should not share runners')
-  }
   if (runner.worker.name !== task.worker || runner.project !== task.project) {
     return false
+  }
+  // an isolated task only reruns on the warm worker of its own files, which
+  // keeps the worker isolated without respawning it for every rerun
+  if (task.isolate) {
+    return (
+      !runner.isTerminated &&
+      isSameFileSet(runner.lastTestFiles, task.context.files) &&
+      !!runner.worker.canReuse?.(task)
+    )
   }
   // by default, check that the environments are the same
   // some workers (like vmThreads/vmForks) do not need this check
@@ -348,6 +387,13 @@ function isEqualRunner(runner: PoolRunner, task: PoolTask) {
     return isEnvironmentEqual(task.context.environment, runner.environment)
   }
   return runner.worker.canReuse(task)
+}
+
+function isSameFileSet(runnerFiles: string[], files: PoolTask['context']['files']) {
+  return (
+    runnerFiles.length === files.length &&
+    files.every((file) => runnerFiles.includes(file.filepath))
+  )
 }
 
 function isEnvironmentEqual(env1: ContextTestEnvironment, env2: ContextTestEnvironment): boolean {

@@ -40,6 +40,12 @@ export interface PoolWorker {
    * This is called on workers that already satisfy certain constraints:
    * - The task has the same worker name
    * - The task has the same project
+   * - Isolated tasks are only routed to a worker that already ran the same
+   * test files. In watch mode such workers stay alive between reruns.
+   *
+   * Vitest asks this both when parking the worker after its task and when
+   * routing a rerun, so it should only depend on the task. When it returns
+   * `false`, the task runs on a new worker instead.
    */
   canReuse?: (task: PoolTask) => boolean
 }

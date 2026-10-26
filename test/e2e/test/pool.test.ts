@@ -1,7 +1,9 @@
-import type { SerializedConfig } from 'vitest'
-import type { TestUserConfig } from 'vitest/node'
-import { normalize } from 'pathe'
+import type { RunnerTestCase, PoolOptions, PoolWorker, SerializedConfig } from 'vitest'
+import type { TestUserConfig, WorkerRequest, WorkerResponse } from 'vitest/node'
+import EventEmitter from 'node:events'
+import { basename, normalize } from 'pathe'
 import { assert, describe, expect, test, vi } from 'vitest'
+import { createFileTask } from '../../../packages/vitest/src/utils/tasks'
 import { runVitest, StableTestFileOrderSorter } from '../../test-utils'
 
 describe.each(['forks', 'threads', 'vmThreads', 'vmForks'])('%s', async (pool) => {
@@ -153,6 +155,107 @@ test('worker start failure should not hang', async () => {
 
   expect(stop).toHaveBeenCalled()
 })
+
+test('isolated tasks are never shared by custom pools without canReuse', async () => {
+  const workers: string[] = []
+
+  const { stdout, stderr } = await runVitest({
+    root: './fixtures/pool',
+    include: ['a.test.ts', 'b.test.ts'],
+    sequence: { sequencer: StableTestFileOrderSorter },
+    pool: {
+      name: 'no-reuse-pool',
+      createPoolWorker: (options) => new NoReusePoolWorker(options, workers),
+    },
+  })
+
+  expect(stderr).toBe('')
+  expect(stdout).toContain('Test Files  2 passed')
+  expect(workers).toEqual(['created', 'a.test.ts', 'created', 'b.test.ts'])
+})
+
+class NoReusePoolWorker implements PoolWorker {
+  readonly name = 'no-reuse-pool'
+  private readonly events = new EventEmitter()
+
+  constructor(
+    private readonly options: PoolOptions,
+    private readonly workers: string[],
+  ) {
+    this.workers.push('created')
+  }
+
+  send(message: WorkerRequest): void {
+    void this.onMessage(message).then((response) => {
+      if (response) {
+        this.events.emit('message', response)
+      }
+    })
+  }
+
+  on(event: string, callback: (arg: any) => void): void {
+    this.events.on(event, callback)
+  }
+
+  off(event: string, callback: (arg: any) => void): void {
+    this.events.off(event, callback)
+  }
+
+  deserialize(data: unknown): unknown {
+    return data
+  }
+
+  async start(): Promise<void> {}
+
+  async stop(): Promise<void> {}
+
+  private async onMessage(message: WorkerRequest): Promise<WorkerResponse | void> {
+    if (message?.__vitest_worker_request__ !== true) {
+      return
+    }
+
+    if (message.type === 'start' || message.type === 'stop') {
+      return message.type === 'start'
+        ? { type: 'started', __vitest_worker_response__: true }
+        : { type: 'stopped', __vitest_worker_response__: true }
+    }
+
+    if (message.type === 'run' || message.type === 'collect') {
+      const project = this.options.project
+      const files = message.context.files.map((file) => normalize(file.filepath))
+      this.workers.push(...files.map((file) => basename(file)))
+
+      for (const moduleId of files) {
+        project.vitest.state.clearFiles(project)
+        const taskFile = createFileTask(moduleId, project.config.root, project.name, 'custom')
+        taskFile.mode = 'run'
+        taskFile.result = { state: 'pass' }
+        const taskName = 'custom test'
+        const taskTest: RunnerTestCase = {
+          type: 'test',
+          name: taskName,
+          fullName: `${taskFile.fullName} > ${taskName}`,
+          fullTestName: `${taskFile.fullTestName} > ${taskName}`,
+          id: `${taskFile.id}_0`,
+          context: {} as any,
+          suite: taskFile,
+          mode: 'run',
+          meta: {},
+          annotations: [],
+          artifacts: [],
+          timeout: 0,
+          file: taskFile,
+          benchmarks: [],
+          result: { state: 'pass' },
+        }
+        taskFile.tasks.push(taskTest)
+        await project.vitest._reportFileTask(taskFile)
+      }
+
+      return { type: 'testfileFinished', __vitest_worker_response__: true }
+    }
+  }
+}
 
 async function getConfig<T = SerializedConfig>(
   options: Partial<TestUserConfig>,

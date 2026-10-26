@@ -113,6 +113,25 @@ class CustomPoolWorker implements PoolWorker {
 }
 ```
 
+### Warm workers in watch mode
+
+Workers can define the optional `canReuse` method to opt into worker reuse:
+
+```ts
+import type { PoolTask } from 'vitest/node'
+
+class CustomPoolWorker implements PoolWorker {
+  canReuse(task: PoolTask): boolean {
+    // return `false` to retire this worker and spawn a new one for the task
+    return true
+  }
+}
+```
+
+In watch mode, an isolated test file that ran on a reusable worker keeps that worker alive until Vitest quits, and a rerun of the same file is routed back to it instead of spawning a new worker. Isolation is preserved by routing: the worker only ever runs the files it already ran. This trades memory (one worker per test file) for fast reruns, which is useful for pools with expensive workers like browser contexts, emulators or editor instances.
+
+Without `watch`, or when the worker doesn't implement `canReuse`, every test file gets a fresh worker that is terminated when its task finishes.
+
 Your `CustomPoolRunner` will be controlling how your custom test runner worker life cycles and communication channel works. For example, your `CustomPoolRunner` could launch a `node:worker_threads` `Worker`, and provide communication via `Worker.postMessage` and `parentPort`.
 
 In your worker file, you can import helper utilities from `vitest/worker`:
